@@ -21,7 +21,7 @@ GMAIL_USER = os.getenv("GMAIL_USER", "beniwalgaurav@fam")                  # MUS
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "qkvjehdeidsrishw")  # MUST be set on Render
 UPI_ID = os.getenv("UPI_ID", "beniwalgaurav@fam")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Gaurav Beniwal")
-DB_PATH = os.getenv("DB_PATH", "/var/data/payments.db")
+DB_PATH = os.getenv("DB_PATH", "./payments.db")
 
 # ============================================================
 # DATABASE — Persistent storage for orders and verified payments
