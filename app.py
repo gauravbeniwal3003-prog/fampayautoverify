@@ -16,7 +16,7 @@ from pydantic import BaseModel
 # ============================================================
 # CONFIGURATION
 # ============================================================
-GMAIL_USER = os.getenv("GMAIL_USER", "beniwalgaurav@fam")                  # MUST be set on Render
+GMAIL_USER = os.getenv("GMAIL_USER", "gauravbeniwal30003@gmail.com")                  # MUST be set on Render
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "qkvjehdeidsrishw")  # MUST be set on Render
 UPI_ID = os.getenv("UPI_ID", "beniwalgaurav@fam")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Gaurav Beniwal")
