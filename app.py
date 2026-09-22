@@ -17,11 +17,11 @@ from pydantic import BaseModel
 # ============================================================
 # CONFIGURATION — Set these as Environment Variables on Render
 # ============================================================
-GMAIL_USER = os.getenv("GMAIL_USER")              # e.g. your_email@gmail.com
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")  # 16-char app password
+GMAIL_USER = os.getenv("GMAIL_USER", "beniwalgaurav@fam")                  # MUST be set on Render
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "qkvjehdeidsrishw")  # MUST be set on Render
 UPI_ID = os.getenv("UPI_ID", "beniwalgaurav@fam")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Gaurav Beniwal")
-DB_PATH = os.getenv("DB_PATH", "/var/data/payments.db")  # Persist on Render disk
+DB_PATH = os.getenv("DB_PATH", "/var/data/payments.db")
 
 # ============================================================
 # DATABASE — Persistent storage for orders and verified payments
