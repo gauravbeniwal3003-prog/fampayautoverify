@@ -10,7 +10,7 @@ import base64
 
 import qrcode
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response, HTMLResponse, JSONResponse
+from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel
 
 # ============================================================
@@ -21,6 +21,7 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "qkvjehdeidsrishw")  # MUST
 UPI_ID = os.getenv("UPI_ID", "beniwalgaurav@fam")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Gaurav Beniwal")
 DB_PATH = os.getenv("DB_PATH", "./payments.db")
+SEARCH_DAYS = 3  # Look back 3 days in Gmail
 
 if not GMAIL_USER or not GMAIL_APP_PASSWORD:
     raise RuntimeError("Missing GMAIL_USER or GMAIL_APP_PASSWORD env vars")
@@ -50,6 +51,17 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+    # Cache of recently parsed payment emails to avoid re-fetching
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS email_cache (
+            utr TEXT PRIMARY KEY,
+            amount TEXT,
+            sender_name TEXT,
+            note TEXT,
+            body TEXT,
+            received_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -65,7 +77,7 @@ def get_db():
         conn.close()
 
 # ============================================================
-# EMAIL VERIFIER
+# EMAIL VERIFIER — searches last 3 days
 # ============================================================
 class FamPayEmailVerifier:
     def __init__(self, gmail_user, app_password):
@@ -100,18 +112,47 @@ class FamPayEmailVerifier:
                 return None
         return None
 
-    def find_payment(self, expected_amount, note, max_age_minutes=60):
+    def _parse_payment(self, body):
+        """Extract amount, UTR, sender, note from email body."""
+        amount = None
+        for pattern in [
+            r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+            r'([\d,]+\.?\d*)\s*(?:Rs\.?|INR|₹)',
+        ]:
+            m = re.search(pattern, body, re.IGNORECASE)
+            if m:
+                amount = m.group(1).replace(",", "")
+                break
+
+        utr_match = re.search(r'\b(\d{12})\b', body)
+        utr = utr_match.group(1) if utr_match else None
+
+        name_match = re.search(r'(?:from|by|paid by)[:\s]+([A-Za-z\s]{2,40})', body, re.IGNORECASE)
+        sender_name = name_match.group(1).strip() if name_match else "Unknown"
+
+        # Try to extract a note — FamPay typically shows it after "Note:" or "Ref:"
+        note_match = re.search(r'(?:note|ref(?:erence)?|remark)[:\s]+([A-Za-z0-9_\-]+)', body, re.IGNORECASE)
+        note = note_match.group(1) if note_match else None
+
+        return {"amount": amount, "utr": utr, "sender_name": sender_name, "note": note}
+
+    def fetch_all_payments(self, days=SEARCH_DAYS):
+        """
+        Fetch and parse all FamPay payment emails from last N days.
+        Caches parsed results in SQLite. Returns list of payment dicts.
+        """
         try:
             mail = self._connect()
         except Exception as e:
-            return {"verified": False, "message": f"IMAP connection failed: {str(e)}"}
+            return {"error": f"IMAP connection failed: {str(e)}", "payments": []}
 
+        payments = []
         try:
-            since_date = (datetime.now() - timedelta(minutes=max_age_minutes)).strftime("%d-%b-%Y")
+            since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
             status, messages = mail.search(None, f'(SINCE "{since_date}")')
             if status != "OK":
                 mail.logout()
-                return {"verified": False, "message": "Email search failed"}
+                return {"error": "Email search failed", "payments": []}
 
             email_ids = messages[0].split()
             for eid in reversed(email_ids):
@@ -123,59 +164,88 @@ class FamPayEmailVerifier:
                 sender = (msg.get("From") or "").lower()
                 subject = (msg.get("Subject") or "").lower()
 
-                if not ("fam" in sender or "fam" in subject or "payment" in subject):
+                if not ("fam" in sender or "fam" in subject or "payment" in subject or "upi" in subject):
                     continue
 
                 body = self._extract_body(msg)
                 if not body:
                     continue
 
-                amount_patterns = [
-                    r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
-                    r'([\d,]+\.?\d*)\s*(?:Rs\.?|INR|₹)',
-                ]
-                found_amount = None
-                for pattern in amount_patterns:
-                    m = re.search(pattern, body, re.IGNORECASE)
-                    if m:
-                        found_amount = m.group(1).replace(",", "")
-                        break
-                if not found_amount:
+                parsed = self._parse_payment(body)
+                if not parsed["utr"] and not parsed["amount"]:
                     continue
 
-                try:
-                    if abs(float(found_amount) - float(expected_amount)) > 0.01:
-                        continue
-                except ValueError:
-                    continue
+                parsed["subject"] = msg.get("Subject", "")
+                parsed["received_at"] = msg.get("Date", "")
+                payments.append(parsed)
 
-                utr_match = re.search(r'\b(\d{12})\b', body)
-                utr = utr_match.group(1) if utr_match else None
-
-                note_found = note.lower() in body.lower() if note else True
-                if not note_found:
-                    continue
-
-                name_match = re.search(r'(?:from|by|paid by)[:\s]+([A-Za-z\s]+)', body, re.IGNORECASE)
-                sender_name = name_match.group(1).strip() if name_match else "Unknown"
-
-                mail.logout()
-                return {
-                    "verified": True,
-                    "amount": found_amount,
-                    "utr": utr,
-                    "sender_name": sender_name,
-                    "note_matched": note_found,
-                }
+                # Cache into DB
+                if parsed["utr"]:
+                    with get_db() as conn:
+                        conn.execute(
+                            """INSERT OR IGNORE INTO email_cache
+                               (utr, amount, sender_name, note, body, received_at)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (parsed["utr"], parsed["amount"], parsed["sender_name"],
+                             parsed["note"], body[:5000], parsed["received_at"])
+                        )
+                        conn.commit()
 
             mail.logout()
-            return {"verified": False, "message": "No matching payment found in recent emails"}
+            return {"error": None, "payments": payments}
         except Exception as e:
             try:
                 mail.logout()
             except Exception:
                 pass
-            return {"verified": False, "message": f"Verification error: {str(e)}"}
+            return {"error": f"Verification error: {str(e)}", "payments": []}
+
+    def find_by_utr(self, utr, days=SEARCH_DAYS):
+        """Search 3 days of emails for a specific UTR."""
+        result = self.fetch_all_payments(days=days)
+        if result.get("error"):
+            return {"verified": False, "message": result["error"]}
+        for p in result["payments"]:
+            if p.get("utr") == utr:
+                return {"verified": True, **p}
+        return {"verified": False, "message": f"UTR {utr} not found in last {days} days"}
+
+    def find_by_amount_and_note(self, expected_amount, note, days=SEARCH_DAYS):
+        """Search 3 days of emails matching amount and note."""
+        result = self.fetch_all_payments(days=days)
+        if result.get("error"):
+            return {"verified": False, "message": result["error"]}
+        for p in result["payments"]:
+            if not p.get("amount"):
+                continue
+            try:
+                if abs(float(p["amount"]) - float(expected_amount)) > 0.01:
+                    continue
+            except ValueError:
+                continue
+            if note and p.get("note") and note.lower() not in (p["note"] or "").lower():
+                # Note present in email but doesn't match
+                continue
+            return {"verified": True, **p}
+        return {"verified": False, "message": "No matching payment found"}
+
+    def find_by_amount_only(self, expected_amount, days=SEARCH_DAYS):
+        """Search 3 days of emails matching only the amount."""
+        result = self.fetch_all_payments(days=days)
+        if result.get("error"):
+            return {"verified": False, "message": result["error"]}
+        matches = []
+        for p in result["payments"]:
+            if not p.get("amount"):
+                continue
+            try:
+                if abs(float(p["amount"]) - float(expected_amount)) <= 0.01:
+                    matches.append(p)
+            except ValueError:
+                continue
+        if matches:
+            return {"verified": True, "matches": matches, **matches[0]}
+        return {"verified": False, "message": "No matching payment found"}
 
 # ============================================================
 # FASTAPI APP
@@ -217,44 +287,63 @@ def _store_order(order_id, amount, note):
         )
         conn.commit()
 
-# -------- HOME / DOCS PAGE --------
+# -------- DOCS PAGE — READY-TO-USE URLS --------
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
     <html><head><title>FamPay UPI Verify</title>
     <style>
-    body{font-family:system-ui;max-width:900px;margin:40px auto;padding:20px;background:#fafafa;color:#222}
-    h1{color:#111} a{color:#0066cc;text-decoration:none} a:hover{text-decoration:underline}
+    body{font-family:system-ui;max-width:960px;margin:40px auto;padding:20px;background:#fafafa;color:#222}
+    h1{color:#111}
+    a{color:#0066cc;text-decoration:none;word-break:break-all}
+    a:hover{text-decoration:underline}
     .card{background:white;padding:20px;border-radius:8px;margin:15px 0;box-shadow:0 2px 6px rgba(0,0,0,0.06)}
-    code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:14px}
-    .endpoint{display:block;margin:8px 0;padding:8px 12px;background:#f8f8f8;border-left:3px solid #0066cc;border-radius:4px}
+    .endpoint{display:block;margin:8px 0;padding:10px 14px;background:#f4f8ff;border-left:3px solid #0066cc;border-radius:4px;font-size:14px}
+    h2{font-size:18px;margin-top:0}
+    .hint{color:#555;font-size:14px;margin:6px 0}
     </style></head><body>
     <h1>FamPay UPI Verification System</h1>
-    <p>Personal payment gateway with QR generation, email verification, and UTR check.</p>
+    <p class="hint">Click any link to test directly in your browser. QR renders as image.</p>
 
     <div class="card"><h2>1. Health Check</h2>
-    <a class="endpoint" href="/health">GET /health</a></div>
+    <a class="endpoint" href="/health">https://fampayautoverify.onrender.com/health</a></div>
 
-    <div class="card"><h2>2. Create Order (JSON)</h2>
-    <a class="endpoint" href="/create-order-get?amount=10&note=TEST001">/create-order-get?amount=10&note=TEST001</a>
-    <p>Returns full order JSON including base64 QR.</p></div>
+    <div class="card"><h2>2. Create Order — QR Image (scan to pay)</h2>
+    <a class="endpoint" href="/create-order-qr?amount=10&note=ORDER1001">https://fampayautoverify.onrender.com/create-order-qr?amount=10&note=ORDER1001</a>
+    <p class="hint">Change amount and note in the URL. The QR shows on screen.</p></div>
 
-    <div class="card"><h2>3. Create Order (QR Image)</h2>
-    <a class="endpoint" href="/create-order-qr?amount=10&note=TEST001">/create-order-qr?amount=10&note=TEST001</a>
-    <p>Renders the QR image directly in browser. Scan with UPI app.</p></div>
+    <div class="card"><h2>3. Create Order — JSON</h2>
+    <a class="endpoint" href="/create-order-get?amount=10&note=ORDER1001">https://fampayautoverify.onrender.com/create-order-get?amount=10&note=ORDER1001</a>
+    <p class="hint">Returns order_id, upi_url, and base64 QR in JSON.</p></div>
 
     <div class="card"><h2>4. Check Order Status</h2>
-    <a class="endpoint" href="/order/ORD20250922143012TEST001">/order/{order_id}</a></div>
+    <a class="endpoint" href="/order/ORD20250922143012ORDER1001">https://fampayautoverify.onrender.com/order/ORD20250922143012ORDER1001</a>
+    <p class="hint">Replace the order_id at the end.</p></div>
 
-    <div class="card"><h2>5. Verify by UTR</h2>
-    <a class="endpoint" href="/verify-by-utr-get?order_id=ORD20250922143012TEST001&utr=123456789012">/verify-by-utr-get?order_id=...&utr=...</a></div>
+    <div class="card"><h2>5. Verify by UTR Only</h2>
+    <a class="endpoint" href="/verify-utr-only?utr=123456789012">https://fampayautoverify.onrender.com/verify-utr-only?utr=123456789012</a>
+    <p class="hint">Searches last 3 days of emails for this UTR. No order_id needed.</p></div>
 
-    <div class="card"><h2>6. Verify by Amount</h2>
-    <a class="endpoint" href="/verify-by-amount-get?order_id=ORD20250922143012TEST001">/verify-by-amount-get?order_id=...</a></div>
+    <div class="card"><h2>6. Verify by Order ID + UTR</h2>
+    <a class="endpoint" href="/verify-by-utr-get?order_id=ORD20250922143012ORDER1001&utr=123456789012">https://fampayautoverify.onrender.com/verify-by-utr-get?order_id=ORD20250922143012ORDER1001&utr=123456789012</a></div>
 
-    <div class="card"><h2>7. Interactive Docs</h2>
-    <a class="endpoint" href="/docs">/docs</a>
-    <a class="endpoint" href="/redoc">/redoc</a></div>
+    <div class="card"><h2>7. Verify by Order ID Only</h2>
+    <a class="endpoint" href="/verify-by-amount-get?order_id=ORD20250922143012ORDER1001">https://fampayautoverify.onrender.com/verify-by-amount-get?order_id=ORD20250922143012ORDER1001</a>
+    <p class="hint">Matches amount and note from the stored order.</p></div>
+
+    <div class="card"><h2>8. Verify by Amount Only</h2>
+    <a class="endpoint" href="/verify-amount-only?amount=10">https://fampayautoverify.onrender.com/verify-amount-only?amount=10</a>
+    <p class="hint">Searches last 3 days of emails for this exact amount.</p></div>
+
+    <div class="card"><h2>9. All Payments (Last 3 Days)</h2>
+    <a class="endpoint" href="/payments?days=3">https://fampayautoverify.onrender.com/payments?days=3</a>
+    <p class="hint">Lists every FamPay payment parsed from email in the last 3 days.</p></div>
+
+    <div class="card"><h2>10. Swagger UI</h2>
+    <a class="endpoint" href="/docs">https://fampayautoverify.onrender.com/docs</a></div>
+
+    <div class="card"><h2>11. ReDoc</h2>
+    <a class="endpoint" href="/redoc">https://fampayautoverify.onrender.com/redoc</a></div>
     </body></html>
     """
 
@@ -262,7 +351,7 @@ async def home():
 async def health():
     return {"status": "ok", "service": "fam-pay-verifier"}
 
-# -------- CREATE ORDER (POST) --------
+# -------- CREATE ORDER --------
 @app.post("/create-order")
 async def create_order(req: CreateOrderRequest):
     order_id = _make_order_id(req.note)
@@ -278,12 +367,10 @@ async def create_order(req: CreateOrderRequest):
         "qr_image_base64": qr_b64,
     }
 
-# -------- CREATE ORDER (GET JSON) --------
 @app.get("/create-order-get")
 async def create_order_get(amount: float, note: str):
     return await create_order(CreateOrderRequest(amount=amount, note=note))
 
-# -------- CREATE ORDER (GET QR IMAGE) --------
 @app.get("/create-order-qr")
 async def create_order_qr(amount: float, note: str):
     order_id = _make_order_id(note)
@@ -291,6 +378,72 @@ async def create_order_qr(amount: float, note: str):
     qr_bytes = _make_qr_png(upi_url)
     _store_order(order_id, amount, note)
     return Response(content=qr_bytes, media_type="image/png")
+
+# -------- VERIFY BY UTR ONLY (NEW) --------
+@app.get("/verify-utr-only")
+async def verify_utr_only(utr: str):
+    """
+    Verify a payment using only the UTR. Searches last 3 days of FamPay emails.
+    Does NOT require an order_id.
+    """
+    # Check if this UTR was already used
+    with get_db() as conn:
+        used = conn.execute("SELECT * FROM used_utrs WHERE utr = ?", (utr,)).fetchone()
+        if used:
+            return {
+                "verified": False,
+                "message": f"UTR {utr} already used for order {used['order_id']}",
+                "used_for": used["order_id"],
+            }
+
+    result = verifier.find_by_utr(utr, days=SEARCH_DAYS)
+    if result.get("verified"):
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO used_utrs (utr, order_id, created_at) VALUES (?, ?, ?)",
+                (utr, "DIRECT-" + utr, datetime.now().isoformat())
+            )
+            conn.commit()
+        return {
+            "verified": True,
+            "utr": utr,
+            "amount": result.get("amount"),
+            "sender_name": result.get("sender_name"),
+            "note": result.get("note"),
+            "received_at": result.get("received_at"),
+        }
+    return {"verified": False, "message": result.get("message")}
+
+# -------- VERIFY BY AMOUNT ONLY (NEW) --------
+@app.get("/verify-amount-only")
+async def verify_amount_only(amount: float):
+    """
+    Verify a payment using only the amount. Searches last 3 days of emails.
+    Returns all matching payments.
+    """
+    result = verifier.find_by_amount_only(amount, days=SEARCH_DAYS)
+    if result.get("verified"):
+        return {
+            "verified": True,
+            "amount": amount,
+            "matches": result.get("matches", []),
+            "match_count": len(result.get("matches", [])),
+        }
+    return {"verified": False, "message": result.get("message")}
+
+# -------- PAYMENTS LIST (NEW) --------
+@app.get("/payments")
+async def payments(days: int = 3):
+    """List all FamPay payments parsed from email in the last N days (max 3)."""
+    days = min(max(days, 1), SEARCH_DAYS)
+    result = verifier.fetch_all_payments(days=days)
+    if result.get("error"):
+        return {"error": result["error"], "payments": []}
+    return {
+        "days_searched": days,
+        "count": len(result["payments"]),
+        "payments": result["payments"],
+    }
 
 # -------- VERIFY BY UTR (POST) --------
 @app.post("/verify-by-utr")
@@ -308,17 +461,23 @@ async def verify_by_utr(req: VerifyRequest):
         if used:
             return {"verified": False, "message": "This UTR has already been used for another order"}
 
-    result = verifier.find_payment(order["amount"], order["note"], max_age_minutes=60)
-
-    if result.get("verified"):
-        email_utr = result.get("utr", "")
-        if email_utr and req.utr and email_utr != req.utr:
-            return {"verified": False, "message": f"UTR mismatch: email shows {email_utr}, you submitted {req.utr}"}
-
+    # First, try matching by UTR across 3 days
+    utr_result = verifier.find_by_utr(req.utr, days=SEARCH_DAYS)
+    if utr_result.get("verified"):
+        email_amount = utr_result.get("amount")
+        # If we have an order, make sure the amount matches
+        try:
+            if email_amount and abs(float(email_amount) - float(order["amount"])) > 0.01:
+                return {
+                    "verified": False,
+                    "message": f"UTR found but amount mismatch: email shows {email_amount}, order is {order['amount']}",
+                }
+        except ValueError:
+            pass
         with get_db() as conn:
             conn.execute(
                 "UPDATE orders SET status='VERIFIED', utr=?, sender_name=?, verified_at=? WHERE order_id=?",
-                (req.utr, result.get("sender_name", ""), datetime.now().isoformat(), req.order_id)
+                (req.utr, utr_result.get("sender_name", ""), datetime.now().isoformat(), req.order_id)
             )
             conn.execute(
                 "INSERT OR IGNORE INTO used_utrs (utr, order_id, created_at) VALUES (?, ?, ?)",
@@ -326,12 +485,34 @@ async def verify_by_utr(req: VerifyRequest):
             )
             conn.commit()
         return {
-            "verified": True, "status": "VERIFIED", "amount": result.get("amount"),
-            "utr": req.utr, "sender_name": result.get("sender_name"),
+            "verified": True, "status": "VERIFIED", "amount": email_amount,
+            "utr": req.utr, "sender_name": utr_result.get("sender_name"),
+            "note": utr_result.get("note"),
         }
-    return {"verified": False, "message": result.get("message", "Payment not found. Retry in 30-60 seconds.")}
 
-# -------- VERIFY BY UTR (GET) --------
+    # Fall back to amount+note matching
+    result = verifier.find_by_amount_and_note(order["amount"], order["note"], days=SEARCH_DAYS)
+    if result.get("verified"):
+        email_utr = result.get("utr", "")
+        if email_utr and req.utr and email_utr != req.utr:
+            return {"verified": False, "message": f"UTR mismatch: email shows {email_utr}, you submitted {req.utr}"}
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE orders SET status='VERIFIED', utr=?, sender_name=?, verified_at=? WHERE order_id=?",
+                (req.utr or email_utr, result.get("sender_name", ""), datetime.now().isoformat(), req.order_id)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO used_utrs (utr, order_id, created_at) VALUES (?, ?, ?)",
+                (req.utr or email_utr, req.order_id, datetime.now().isoformat())
+            )
+            conn.commit()
+        return {
+            "verified": True, "status": "VERIFIED", "amount": result.get("amount"),
+            "utr": req.utr or email_utr, "sender_name": result.get("sender_name"),
+        }
+
+    return {"verified": False, "message": result.get("message", "Payment not found in last 3 days.")}
+
 @app.get("/verify-by-utr-get")
 async def verify_by_utr_get(order_id: str, utr: str):
     return await verify_by_utr(VerifyRequest(order_id=order_id, utr=utr))
@@ -349,21 +530,25 @@ async def verify_by_amount(req: VerifyByAmountRequest):
                 "utr": order["utr"], "sender_name": order["sender_name"],
             }
 
-    result = verifier.find_payment(order["amount"], order["note"], max_age_minutes=60)
+    result = verifier.find_by_amount_and_note(order["amount"], order["note"], days=SEARCH_DAYS)
     if result.get("verified"):
         with get_db() as conn:
             conn.execute(
                 "UPDATE orders SET status='VERIFIED', utr=?, sender_name=?, verified_at=? WHERE order_id=?",
                 (result.get("utr", ""), result.get("sender_name", ""), datetime.now().isoformat(), req.order_id)
             )
+            if result.get("utr"):
+                conn.execute(
+                    "INSERT OR IGNORE INTO used_utrs (utr, order_id, created_at) VALUES (?, ?, ?)",
+                    (result["utr"], req.order_id, datetime.now().isoformat())
+                )
             conn.commit()
         return {
             "verified": True, "status": "VERIFIED", "amount": result.get("amount"),
             "utr": result.get("utr"), "sender_name": result.get("sender_name"),
         }
-    return {"verified": False, "message": result.get("message", "Payment not found. Retry in 30-60 seconds.")}
+    return {"verified": False, "message": result.get("message", "Payment not found in last 3 days.")}
 
-# -------- VERIFY BY AMOUNT (GET) --------
 @app.get("/verify-by-amount-get")
 async def verify_by_amount_get(order_id: str):
     return await verify_by_amount(VerifyByAmountRequest(order_id=order_id))
@@ -376,3 +561,10 @@ async def get_order(order_id: str):
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         return dict(order)
+
+# -------- LIST ALL ORDERS --------
+@app.get("/orders")
+async def list_orders():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 200").fetchall()
+        return {"count": len(rows), "orders": [dict(r) for r in rows]}
