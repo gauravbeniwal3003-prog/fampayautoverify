@@ -3,35 +3,114 @@ import email
 import re
 import os
 import sqlite3
-from datetime import datetime, timedelta
-from contextlib import contextmanager
-from io import BytesIO
+import asyncio
+import threading
+import time
 import base64
 
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from email.header import decode_header
+
 import qrcode
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
 UPI_ID = os.getenv("UPI_ID", "beniwalgaurav@fam")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Gaurav Beniwal")
+
 DB_PATH = os.getenv("DB_PATH", "./payments.db")
-SEARCH_DAYS = 3
+
+# How many days of email history should be cached
+SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "3"))
+
+# Background Gmail check interval
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3"))
+
+# Keep only this many days in temporary DB
+CACHE_DAYS = SEARCH_DAYS
 
 if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-    raise RuntimeError("Missing GMAIL_USER or GMAIL_APP_PASSWORD env vars")
+    raise RuntimeError(
+        "Missing GMAIL_USER or GMAIL_APP_PASSWORD environment variables"
+    )
+
+
+# ============================================================
+# GLOBAL COLLECTOR STATE
+# ============================================================
+
+collector_running = False
+collector_started_at = None
+collector_last_check = None
+collector_last_success = None
+collector_last_error = None
+collector_last_uid = 0
+collector_total_scanned = 0
+collector_total_saved = 0
+collector_total_duplicates = 0
+
+collector_thread = None
+collector_stop_event = threading.Event()
+
+state_lock = threading.Lock()
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return utc_now().isoformat()
+
+
+def parse_email_date(date_string):
+    """
+    Convert email Date header into ISO timestamp where possible.
+    """
+    if not date_string:
+        return iso_now()
+
+    try:
+        dt = email.utils.parsedate_to_datetime(date_string)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc).isoformat()
+
+    except Exception:
+        return iso_now()
+
 
 # ============================================================
 # DATABASE
 # ============================================================
+
 def init_db():
+
     conn = sqlite3.connect(DB_PATH)
+
     c = conn.cursor()
+
+    # --------------------------------------------------------
+    # Orders
+    # --------------------------------------------------------
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             order_id TEXT PRIMARY KEY,
@@ -44,418 +123,2478 @@ def init_db():
             verified_at TEXT
         )
     """)
+
+    # --------------------------------------------------------
+    # Cached payment emails
+    # --------------------------------------------------------
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            email_uid INTEGER UNIQUE,
+
+            message_id TEXT,
+
+            utr TEXT,
+
+            amount REAL,
+
+            sender_name TEXT,
+
+            note TEXT,
+
+            subject TEXT,
+
+            sender_email TEXT,
+
+            received_at TEXT,
+
+            cached_at TEXT NOT NULL
+        )
+    """)
+
+    # --------------------------------------------------------
+    # Collector state
+    # --------------------------------------------------------
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS collector_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # --------------------------------------------------------
+    # Indexes
+    # --------------------------------------------------------
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payments_utr
+        ON payments(utr)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payments_amount
+        ON payments(amount)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payments_received
+        ON payments(received_at)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payments_message_id
+        ON payments(message_id)
+    """)
+
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30
+    )
+
     conn.row_factory = sqlite3.Row
+
     try:
         yield conn
     finally:
         conn.close()
 
+
 # ============================================================
-# EMAIL VERIFIER — searches last 3 days, reports only
+# DATABASE STATE
 # ============================================================
-class FamPayEmailVerifier:
+
+def get_state(key, default=None):
+
+    with get_db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT value
+            FROM collector_state
+            WHERE key = ?
+            """,
+            (key,)
+        ).fetchone()
+
+        if not row:
+            return default
+
+        return row["value"]
+
+
+def set_state(key, value):
+
+    with get_db() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO collector_state(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value))
+        )
+
+        conn.commit()
+
+
+# ============================================================
+# ORDER DATABASE
+# ============================================================
+
+def _store_order(order_id, amount, note):
+
+    with get_db() as conn:
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO orders
+            (
+                order_id,
+                amount,
+                note,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, 'PENDING', ?)
+            """,
+            (
+                order_id,
+                amount,
+                note,
+                iso_now()
+            )
+        )
+
+        conn.commit()
+
+
+# ============================================================
+# GMAIL PAYMENT COLLECTOR
+# ============================================================
+
+class FamPayEmailCollector:
+
     def __init__(self, gmail_user, app_password):
+
         self.gmail_user = gmail_user
         self.app_password = app_password
 
-    def _connect(self):
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        mail.login(self.gmail_user, self.app_password)
-        mail.select("inbox")
-        return mail
+        self.mail = None
 
-    def _extract_body(self, msg):
-        if msg.is_multipart():
-            for part in msg.walk():
-                ct = part.get_content_type()
-                if ct == "text/plain":
-                    try:
-                        return part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-                elif ct == "text/html":
-                    try:
-                        html = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                        return re.sub(r"<[^>]+>", " ", html)
-                    except Exception:
-                        continue
-        else:
-            try:
-                return msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-            except Exception:
-                return None
-        return None
+    # --------------------------------------------------------
+    # Connect
+    # --------------------------------------------------------
 
-    def _parse_payment(self, body):
-        amount = None
-        for pattern in [
-            r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
-            r'([\d,]+\.?\d*)\s*(?:Rs\.?|INR|₹)',
-        ]:
-            m = re.search(pattern, body, re.IGNORECASE)
-            if m:
-                amount = m.group(1).replace(",", "")
-                break
+    def connect(self):
 
-        utr_match = re.search(r'\b(\d{12})\b', body)
-        utr = utr_match.group(1) if utr_match else None
+        self.disconnect()
 
-        name_match = re.search(r'(?:from|by|paid by)[:\s]+([A-Za-z\s]{2,40})', body, re.IGNORECASE)
-        sender_name = name_match.group(1).strip() if name_match else "Unknown"
+        mail = imaplib.IMAP4_SSL(
+            "imap.gmail.com",
+            993
+        )
 
-        note_match = re.search(r'(?:note|ref(?:erence)?|remark)[:\s]+([A-Za-z0-9_\-]+)', body, re.IGNORECASE)
-        note = note_match.group(1) if note_match else None
+        mail.login(
+            self.gmail_user,
+            self.app_password
+        )
 
-        return {"amount": amount, "utr": utr, "sender_name": sender_name, "note": note}
+        status, _ = mail.select("INBOX")
 
-    def fetch_all_payments(self, days=SEARCH_DAYS):
-        try:
-            mail = self._connect()
-        except Exception as e:
-            return {"error": f"IMAP connection failed: {str(e)}", "payments": []}
-
-        payments = []
-        try:
-            since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-            status, messages = mail.search(None, f'(SINCE "{since_date}")')
-            if status != "OK":
-                mail.logout()
-                return {"error": "Email search failed", "payments": []}
-
-            email_ids = messages[0].split()
-            for eid in reversed(email_ids):
-                status, msg_data = mail.fetch(eid, "(RFC822)")
-                if status != "OK":
-                    continue
-
-                msg = email.message_from_bytes(msg_data[0][1])
-                sender = (msg.get("From") or "").lower()
-                subject = (msg.get("Subject") or "").lower()
-
-                if not ("fam" in sender or "fam" in subject or "payment" in subject or "upi" in subject):
-                    continue
-
-                body = self._extract_body(msg)
-                if not body:
-                    continue
-
-                parsed = self._parse_payment(body)
-                if not parsed["utr"] and not parsed["amount"]:
-                    continue
-
-                parsed["subject"] = msg.get("Subject", "")
-                parsed["received_at"] = msg.get("Date", "")
-                payments.append(parsed)
-
-            mail.logout()
-            return {"error": None, "payments": payments}
-        except Exception as e:
+        if status != "OK":
             try:
                 mail.logout()
             except Exception:
                 pass
-            return {"error": f"Verification error: {str(e)}", "payments": []}
 
-    def find_by_utr(self, utr, days=SEARCH_DAYS):
-        result = self.fetch_all_payments(days=days)
-        if result.get("error"):
-            return {"found": False, "message": result["error"]}
-        for p in result["payments"]:
-            if p.get("utr") == utr:
-                return {"found": True, "payment": p}
-        return {"found": False, "message": f"UTR {utr} not found in last {days} days"}
+            raise RuntimeError("Could not select Gmail inbox")
 
-    def find_by_amount(self, expected_amount, days=SEARCH_DAYS):
-        result = self.fetch_all_payments(days=days)
-        if result.get("error"):
-            return {"found": False, "message": result["error"], "matches": []}
-        matches = []
-        for p in result["payments"]:
-            if not p.get("amount"):
-                continue
+        self.mail = mail
+
+        return mail
+
+    # --------------------------------------------------------
+    # Disconnect
+    # --------------------------------------------------------
+
+    def disconnect(self):
+
+        if self.mail:
+
             try:
-                if abs(float(p["amount"]) - float(expected_amount)) <= 0.01:
-                    matches.append(p)
-            except ValueError:
+                self.mail.close()
+            except Exception:
+                pass
+
+            try:
+                self.mail.logout()
+            except Exception:
+                pass
+
+        self.mail = None
+
+    # --------------------------------------------------------
+    # Gmail connection health
+    # --------------------------------------------------------
+
+    def ensure_connection(self):
+
+        if self.mail is None:
+            self.connect()
+            return
+
+        try:
+
+            status, _ = self.mail.noop()
+
+            if status != "OK":
+                self.connect()
+
+        except Exception:
+
+            self.connect()
+
+    # --------------------------------------------------------
+    # Decode MIME header
+    # --------------------------------------------------------
+
+    def decode_header_value(self, value):
+
+        if not value:
+            return ""
+
+        try:
+
+            parts = decode_header(value)
+
+            result = ""
+
+            for part, encoding in parts:
+
+                if isinstance(part, bytes):
+
+                    result += part.decode(
+                        encoding or "utf-8",
+                        errors="ignore"
+                    )
+
+                else:
+
+                    result += str(part)
+
+            return result
+
+        except Exception:
+
+            return str(value)
+
+    # --------------------------------------------------------
+    # Extract email body
+    # --------------------------------------------------------
+
+    def extract_body(self, msg):
+
+        text_parts = []
+        html_parts = []
+
+        if msg.is_multipart():
+
+            for part in msg.walk():
+
+                content_type = (
+                    part.get_content_type() or ""
+                ).lower()
+
+                disposition = str(
+                    part.get("Content-Disposition") or ""
+                ).lower()
+
+                if "attachment" in disposition:
+                    continue
+
+                try:
+
+                    payload = part.get_payload(
+                        decode=True
+                    )
+
+                    if not payload:
+                        continue
+
+                    charset = (
+                        part.get_content_charset()
+                        or "utf-8"
+                    )
+
+                    decoded = payload.decode(
+                        charset,
+                        errors="ignore"
+                    )
+
+                    if content_type == "text/plain":
+                        text_parts.append(decoded)
+
+                    elif content_type == "text/html":
+                        html_parts.append(decoded)
+
+                except Exception:
+                    continue
+
+        else:
+
+            try:
+
+                payload = msg.get_payload(
+                    decode=True
+                )
+
+                if payload:
+
+                    charset = (
+                        msg.get_content_charset()
+                        or "utf-8"
+                    )
+
+                    decoded = payload.decode(
+                        charset,
+                        errors="ignore"
+                    )
+
+                    if msg.get_content_type() == "text/html":
+                        html_parts.append(decoded)
+                    else:
+                        text_parts.append(decoded)
+
+            except Exception:
+                pass
+
+        if text_parts:
+            return "\n".join(text_parts)
+
+        if html_parts:
+
+            html = "\n".join(html_parts)
+
+            html = re.sub(
+                r"<br\s*/?>",
+                "\n",
+                html,
+                flags=re.IGNORECASE
+            )
+
+            html = re.sub(
+                r"</p\s*>",
+                "\n",
+                html,
+                flags=re.IGNORECASE
+            )
+
+            html = re.sub(
+                r"<[^>]+>",
+                " ",
+                html
+            )
+
+            html = re.sub(
+                r"\s+",
+                " ",
+                html
+            )
+
+            return html.strip()
+
+        return ""
+
+    # --------------------------------------------------------
+    # Parse payment
+    # --------------------------------------------------------
+
+    def parse_payment(self, body):
+
+        if not body:
+            return {
+                "amount": None,
+                "utr": None,
+                "sender_name": None,
+                "note": None
+            }
+
+        # Normalize whitespace
+        normalized = re.sub(
+            r"[ \t]+",
+            " ",
+            body
+        )
+
+        # ----------------------------------------------------
+        # Amount
+        # ----------------------------------------------------
+
+        amount = None
+
+        amount_patterns = [
+
+            r'(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{1,2})?)',
+
+            r'([\d,]+(?:\.\d{1,2})?)\s*(?:Rs\.?|INR|₹)',
+
+            r'(?:amount|paid|payment|received)[^0-9]{0,30}'
+            r'([\d,]+(?:\.\d{1,2})?)'
+
+        ]
+
+        for pattern in amount_patterns:
+
+            match = re.search(
+                pattern,
+                normalized,
+                re.IGNORECASE
+            )
+
+            if match:
+
+                try:
+
+                    amount = float(
+                        match.group(1).replace(",", "")
+                    )
+
+                    break
+
+                except Exception:
+                    pass
+
+        # ----------------------------------------------------
+        # UTR
+        # ----------------------------------------------------
+
+        utr = None
+
+        utr_patterns = [
+
+            r'(?:UTR|UPI\s*REF(?:ERENCE)?|REF(?:ERENCE)?'
+            r'(?:\s*NO|\s*NUMBER)?|transaction\s*id)'
+            r'[\s:#-]*(\d{8,20})',
+
+            r'\b(\d{12})\b',
+
+            r'\b(\d{16})\b'
+
+        ]
+
+        for pattern in utr_patterns:
+
+            match = re.search(
+                pattern,
+                normalized,
+                re.IGNORECASE
+            )
+
+            if match:
+
+                utr = match.group(1)
+
+                break
+
+        # ----------------------------------------------------
+        # Sender name
+        # ----------------------------------------------------
+
+        sender_name = None
+
+        name_patterns = [
+
+            r'(?:from|by|paid\s*by|received\s*from)'
+            r'[\s:,-]+([A-Za-z][A-Za-z ._-]{1,50})',
+
+            r'(?:sender|payer|customer)'
+            r'[\s:,-]+([A-Za-z][A-Za-z ._-]{1,50})'
+
+        ]
+
+        for pattern in name_patterns:
+
+            match = re.search(
+                pattern,
+                normalized,
+                re.IGNORECASE
+            )
+
+            if match:
+
+                candidate = match.group(1).strip()
+
+                candidate = re.split(
+                    r'\s+(?:via|on|using|through|for)\s+',
+                    candidate,
+                    flags=re.IGNORECASE
+                )[0]
+
+                sender_name = candidate[:80].strip()
+
+                if sender_name:
+                    break
+
+        if not sender_name:
+            sender_name = "Unknown"
+
+        # ----------------------------------------------------
+        # Note / reference
+        # ----------------------------------------------------
+
+        note = None
+
+        note_patterns = [
+
+            r'(?:note|remark|remarks)'
+            r'[\s:=-]+([A-Za-z0-9_.#:/ -]{1,100})',
+
+            r'(?:reference|ref)'
+            r'[\s:=-]+([A-Za-z0-9_.#:/ -]{1,100})'
+
+        ]
+
+        for pattern in note_patterns:
+
+            match = re.search(
+                pattern,
+                normalized,
+                re.IGNORECASE
+            )
+
+            if match:
+
+                note = match.group(1).strip()
+
+                note = note[:100]
+
+                break
+
+        return {
+            "amount": amount,
+            "utr": utr,
+            "sender_name": sender_name,
+            "note": note
+        }
+
+    # --------------------------------------------------------
+    # Check if email looks like payment email
+    # --------------------------------------------------------
+
+    def is_payment_email(
+        self,
+        sender,
+        subject,
+        body
+    ):
+
+        combined = (
+            (sender or "") +
+            " " +
+            (subject or "") +
+            " " +
+            (body or "")
+        ).lower()
+
+        keywords = [
+
+            "fam",
+
+            "fampay",
+
+            "payment",
+
+            "upi",
+
+            "paid",
+
+            "received",
+
+            "transaction",
+
+            "credited"
+
+        ]
+
+        return any(
+            keyword in combined
+            for keyword in keywords
+        )
+
+    # --------------------------------------------------------
+    # Save payment
+    # --------------------------------------------------------
+
+    def save_payment(
+        self,
+        email_uid,
+        message_id,
+        utr,
+        amount,
+        sender_name,
+        note,
+        subject,
+        sender_email,
+        received_at
+    ):
+
+        with get_db() as conn:
+
+            # First check UID
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM payments
+                WHERE email_uid = ?
+                LIMIT 1
+                """,
+                (email_uid,)
+            ).fetchone()
+
+            if existing:
+
+                return False
+
+            # Also prevent duplicate Message-ID
+            if message_id:
+
+                existing = conn.execute(
+                    """
+                    SELECT id
+                    FROM payments
+                    WHERE message_id = ?
+                    LIMIT 1
+                    """,
+                    (message_id,)
+                ).fetchone()
+
+                if existing:
+
+                    return False
+
+            conn.execute(
+                """
+                INSERT INTO payments
+                (
+                    email_uid,
+                    message_id,
+                    utr,
+                    amount,
+                    sender_name,
+                    note,
+                    subject,
+                    sender_email,
+                    received_at,
+                    cached_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email_uid,
+                    message_id,
+                    utr,
+                    amount,
+                    sender_name,
+                    note,
+                    subject,
+                    sender_email,
+                    received_at,
+                    iso_now()
+                )
+            )
+
+            conn.commit()
+
+            return True
+
+    # --------------------------------------------------------
+    # Process one email
+    # --------------------------------------------------------
+
+    def process_email(self, email_uid):
+
+        try:
+
+            status, msg_data = self.mail.fetch(
+                str(email_uid),
+                "(RFC822)"
+            )
+
+            if status != "OK":
+                return False
+
+            raw_message = None
+
+            for item in msg_data:
+
+                if isinstance(item, tuple):
+
+                    raw_message = item[1]
+
+                    break
+
+            if not raw_message:
+                return False
+
+            msg = email.message_from_bytes(
+                raw_message
+            )
+
+            sender = (
+                msg.get("From") or ""
+            )
+
+            sender_decoded = self.decode_header_value(
+                sender
+            )
+
+            subject = self.decode_header_value(
+                msg.get("Subject") or ""
+            )
+
+            body = self.extract_body(msg)
+
+            # Ignore unrelated emails
+            if not self.is_payment_email(
+                sender_decoded,
+                subject,
+                body
+            ):
+                return False
+
+            parsed = self.parse_payment(body)
+
+            # Must contain useful payment information
+            if (
+                not parsed["utr"]
+                and parsed["amount"] is None
+            ):
+                return False
+
+            message_id = (
+                msg.get("Message-ID") or ""
+            ).strip()
+
+            received_at = parse_email_date(
+                msg.get("Date")
+            )
+
+            saved = self.save_payment(
+                email_uid=email_uid,
+                message_id=message_id,
+                utr=parsed["utr"],
+                amount=parsed["amount"],
+                sender_name=parsed["sender_name"],
+                note=parsed["note"],
+                subject=subject,
+                sender_email=sender_decoded,
+                received_at=received_at
+            )
+
+            return saved
+
+        except Exception as e:
+
+            print(
+                f"[Collector] Email UID {email_uid} "
+                f"processing error: {e}"
+            )
+
+            return False
+
+    # --------------------------------------------------------
+    # Initial 3-day backfill
+    # --------------------------------------------------------
+
+    def initial_backfill(self):
+
+        global collector_last_uid
+        global collector_total_scanned
+        global collector_total_saved
+        global collector_total_duplicates
+
+        print(
+            f"[Collector] Starting {SEARCH_DAYS}-day backfill..."
+        )
+
+        self.ensure_connection()
+
+        since_date = (
+            datetime.now() -
+            timedelta(days=SEARCH_DAYS)
+        ).strftime("%d-%b-%Y")
+
+        status, data = self.mail.search(
+            None,
+            f'(SINCE "{since_date}")'
+        )
+
+        if status != "OK":
+
+            raise RuntimeError(
+                "Gmail initial search failed"
+            )
+
+        email_ids = data[0].split()
+
+        print(
+            f"[Collector] Found "
+            f"{len(email_ids)} emails in history"
+        )
+
+        highest_uid = 0
+
+        # Process oldest → newest
+        for raw_uid in email_ids:
+
+            try:
+
+                uid = int(raw_uid)
+
+            except Exception:
                 continue
-        if matches:
-            return {"found": True, "matches": matches}
-        return {"found": False, "matches": [], "message": f"No payment of {expected_amount} found in last {days} days"}
+
+            highest_uid = max(
+                highest_uid,
+                uid
+            )
+
+            before_count = self.get_payment_count()
+
+            saved = self.process_email(uid)
+
+            after_count = self.get_payment_count()
+
+            collector_total_scanned += 1
+
+            if saved:
+                collector_total_saved += 1
+
+            elif after_count == before_count:
+                # Not necessarily duplicate; it may simply
+                # be an unrelated email.
+                pass
+
+        if highest_uid:
+
+            collector_last_uid = highest_uid
+
+            set_state(
+                "last_uid",
+                highest_uid
+            )
+
+        print(
+            f"[Collector] Initial backfill complete. "
+            f"Cached payments: {self.get_payment_count()}"
+        )
+
+    # --------------------------------------------------------
+    # Get cached payment count
+    # --------------------------------------------------------
+
+    def get_payment_count(self):
+
+        with get_db() as conn:
+
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM payments
+                """
+            ).fetchone()
+
+            return int(row["count"])
+
+    # --------------------------------------------------------
+    # Incremental scan
+    # --------------------------------------------------------
+
+    def fetch_new_emails(self):
+
+        global collector_last_uid
+        global collector_total_scanned
+        global collector_total_saved
+
+        self.ensure_connection()
+
+        saved_uid = get_state(
+            "last_uid",
+            "0"
+        )
+
+        try:
+            last_uid = int(saved_uid)
+        except Exception:
+            last_uid = 0
+
+        # Search only UID after our checkpoint
+        status, data = self.mail.uid(
+            "search",
+            None,
+            f"UID {last_uid + 1}:*"
+        )
+
+        if status != "OK":
+
+            raise RuntimeError(
+                "Gmail incremental UID search failed"
+            )
+
+        uid_list = data[0].split()
+
+        if not uid_list:
+            return 0
+
+        saved_count = 0
+
+        highest_uid = last_uid
+
+        for raw_uid in uid_list:
+
+            try:
+
+                uid = int(raw_uid)
+
+            except Exception:
+
+                continue
+
+            highest_uid = max(
+                highest_uid,
+                uid
+            )
+
+            # UID FETCH requires UID command
+            status, msg_data = self.mail.uid(
+                "fetch",
+                str(uid),
+                "(RFC822)"
+            )
+
+            if status != "OK":
+                continue
+
+            raw_message = None
+
+            for item in msg_data:
+
+                if isinstance(item, tuple):
+
+                    raw_message = item[1]
+
+                    break
+
+            if not raw_message:
+                continue
+
+            try:
+
+                msg = email.message_from_bytes(
+                    raw_message
+                )
+
+                sender = (
+                    msg.get("From") or ""
+                )
+
+                sender_decoded = self.decode_header_value(
+                    sender
+                )
+
+                subject = self.decode_header_value(
+                    msg.get("Subject") or ""
+                )
+
+                body = self.extract_body(msg)
+
+                if not self.is_payment_email(
+                    sender_decoded,
+                    subject,
+                    body
+                ):
+                    continue
+
+                parsed = self.parse_payment(body)
+
+                if (
+                    not parsed["utr"]
+                    and parsed["amount"] is None
+                ):
+                    continue
+
+                message_id = (
+                    msg.get("Message-ID") or ""
+                ).strip()
+
+                received_at = parse_email_date(
+                    msg.get("Date")
+                )
+
+                saved = self.save_payment(
+                    email_uid=uid,
+                    message_id=message_id,
+                    utr=parsed["utr"],
+                    amount=parsed["amount"],
+                    sender_name=parsed["sender_name"],
+                    note=parsed["note"],
+                    subject=subject,
+                    sender_email=sender_decoded,
+                    received_at=received_at
+                )
+
+                collector_total_scanned += 1
+
+                if saved:
+
+                    collector_total_saved += 1
+                    saved_count += 1
+
+            except Exception as e:
+
+                print(
+                    f"[Collector] New email parse error: {e}"
+                )
+
+        if highest_uid > last_uid:
+
+            collector_last_uid = highest_uid
+
+            set_state(
+                "last_uid",
+                highest_uid
+            )
+
+        return saved_count
+
+    # --------------------------------------------------------
+    # Cleanup old temporary payments
+    # --------------------------------------------------------
+
+    def cleanup_old_payments(self):
+
+        cutoff = (
+            utc_now() -
+            timedelta(days=CACHE_DAYS)
+        ).isoformat()
+
+        with get_db() as conn:
+
+            cursor = conn.execute(
+                """
+                DELETE FROM payments
+                WHERE received_at < ?
+                """,
+                (cutoff,)
+            )
+
+            deleted = cursor.rowcount
+
+            conn.commit()
+
+        if deleted:
+
+            print(
+                f"[Collector] Removed "
+                f"{deleted} expired cached payments"
+            )
+
+        return deleted
+
+    # --------------------------------------------------------
+    # One collector cycle
+    # --------------------------------------------------------
+
+    def run_cycle(self):
+
+        self.fetch_new_emails()
+
+        self.cleanup_old_payments()
+
 
 # ============================================================
-# FASTAPI APP
+# BACKGROUND COLLECTOR
 # ============================================================
-app = FastAPI(title="FamPay UPI Verification System")
-verifier = FamPayEmailVerifier(GMAIL_USER, GMAIL_APP_PASSWORD)
+
+collector = FamPayEmailCollector(
+    GMAIL_USER,
+    GMAIL_APP_PASSWORD
+)
+
+
+def collector_worker():
+
+    global collector_running
+    global collector_started_at
+    global collector_last_check
+    global collector_last_success
+    global collector_last_error
+
+    collector_running = True
+    collector_started_at = iso_now()
+
+    print("=" * 60)
+    print("FAMPAY BACKGROUND PAYMENT COLLECTOR")
+    print("=" * 60)
+
+    try:
+
+            # ----------------------------------------------------
+        # STEP 1
+        # Initial 3-day scan
+        # ----------------------------------------------------
+
+        collector.initial_backfill()
+
+        # ----------------------------------------------------
+        # STEP 2
+        # Continuous incremental monitoring
+        # ----------------------------------------------------
+
+        print(
+            f"[Collector] Monitoring Gmail every "
+            f"{POLL_INTERVAL} seconds..."
+        )
+
+        while not collector_stop_event.is_set():
+
+            cycle_start = time.time()
+
+            try:
+
+                collector.run_cycle()
+
+                collector_last_success = iso_now()
+                collector_last_error = None
+
+                collector_last_check = iso_now()
+
+            except Exception as e:
+
+                collector_last_error = str(e)
+                collector_last_check = iso_now()
+
+                print(
+                    "[Collector] Cycle error:",
+                    str(e)
+                )
+
+                # Force reconnect on next cycle
+                try:
+                    collector.disconnect()
+                except Exception:
+                    pass
+
+            elapsed = time.time() - cycle_start
+
+            sleep_for = max(
+                0,
+                POLL_INTERVAL - elapsed
+            )
+
+            collector_stop_event.wait(
+                sleep_for
+            )
+
+    except Exception as e:
+
+        collector_last_error = str(e)
+
+        print(
+            "[Collector] Fatal error:",
+            str(e)
+        )
+
+    finally:
+
+        collector_running = False
+
+        try:
+            collector.disconnect()
+        except Exception:
+            pass
+
+        print(
+            "[Collector] Worker stopped"
+        )
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="FamPay UPI Verification System",
+    version="2.0"
+)
+
+
+# ============================================================
+# STARTUP / SHUTDOWN
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    global collector_thread
+
+    collector_stop_event.clear()
+
+    collector_thread = threading.Thread(
+        target=collector_worker,
+        daemon=True,
+        name="FamPayPaymentCollector"
+    )
+
+    collector_thread.start()
+
+    print(
+        "[System] Background payment collector started"
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+
+    collector_stop_event.set()
+
+    try:
+        collector.disconnect()
+    except Exception:
+        pass
+
+    print(
+        "[System] Background collector shutdown requested"
+    )
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
 class CreateOrderRequest(BaseModel):
+
     amount: float
     note: str
 
+
 class VerifyRequest(BaseModel):
+
     order_id: str
     utr: str
 
+
 class VerifyByAmountRequest(BaseModel):
+
     order_id: str
 
+
+# ============================================================
+# QR / ORDER HELPERS
+# ============================================================
+
 def _make_upi_url(amount, note):
-    return f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount:.2f}&cu=INR&tn={note}"
+
+    return (
+        f"upi://pay?"
+        f"pa={UPI_ID}"
+        f"&pn={PAYEE_NAME}"
+        f"&am={amount:.2f}"
+        f"&cu=INR"
+        f"&tn={note}"
+    )
+
 
 def _make_order_id(note):
-    return f"ORD{datetime.now().strftime('%Y%m%d%H%M%S')}{note}"
+
+    safe_note = re.sub(
+        r"[^A-Za-z0-9_-]",
+        "",
+        str(note)
+    )
+
+    return (
+        f"ORD"
+        f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        f"{safe_note[:30]}"
+    )
+
 
 def _make_qr_png(upi_url):
-    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+
+    qr = qrcode.QRCode(
+        version=1,
+        box_size=10,
+        border=4
+    )
+
     qr.add_data(upi_url)
+
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+
+    img = qr.make_image(
+        fill_color="black",
+        back_color="white"
+    )
+
+    from io import BytesIO
+
     buf = BytesIO()
-    img.save(buf, format="PNG")
+
+    img.save(
+        buf,
+        format="PNG"
+    )
+
     return buf.getvalue()
 
-def _store_order(order_id, amount, note):
-    with get_db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO orders (order_id, amount, note, status, created_at) VALUES (?, ?, ?, 'PENDING', ?)",
-            (order_id, amount, note, datetime.now().isoformat())
-        )
-        conn.commit()
 
-# -------- DOCS PAGE --------
-@app.get("/", response_class=HTMLResponse)
+# ============================================================
+# HOME PAGE
+# ============================================================
+
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
 async def home():
+
     return """
-    <html><head><title>FamPay UPI Verify</title>
-    <style>
-    body{font-family:system-ui;max-width:960px;margin:40px auto;padding:20px;background:#fafafa;color:#222}
-    h1{color:#111}
-    a{color:#0066cc;text-decoration:none;word-break:break-all}
-    a:hover{text-decoration:underline}
-    .card{background:white;padding:20px;border-radius:8px;margin:15px 0;box-shadow:0 2px 6px rgba(0,0,0,0.06)}
-    .endpoint{display:block;margin:8px 0;padding:10px 14px;background:#f4f8ff;border-left:3px solid #0066cc;border-radius:4px;font-size:14px}
-    h2{font-size:18px;margin-top:0}
-    .hint{color:#555;font-size:14px;margin:6px 0}
-    </style></head><body>
-    <h1>FamPay UPI Verification System</h1>
-    <p class="hint">Gateway reports info only. Your website decides the rules.</p>
+    <!DOCTYPE html>
+    <html>
 
-    <div class="card"><h2>1. Health Check</h2>
-    <a class="endpoint" href="/health">https://fampayautoverify.onrender.com/health</a></div>
+    <head>
 
-    <div class="card"><h2>2. Create Order — QR Image</h2>
-    <a class="endpoint" href="/create-order-qr?amount=10&note=ORDER1001">https://fampayautoverify.onrender.com/create-order-qr?amount=10&note=ORDER1001</a></div>
+        <meta charset="UTF-8">
 
-    <div class="card"><h2>3. Create Order — JSON</h2>
-    <a class="endpoint" href="/create-order-get?amount=10&note=ORDER1001">https://fampayautoverify.onrender.com/create-order-get?amount=10&note=ORDER1001</a></div>
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
 
-    <div class="card"><h2>4. Check Order Status</h2>
-    <a class="endpoint" href="/order/ORD20260922162131U1T1790094090">https://fampayautoverify.onrender.com/order/ORD20260922162131U1T1790094090</a></div>
+        <title>FamPay UPI Verification System</title>
 
-    <div class="card"><h2>5. Verify by UTR Only</h2>
-    <a class="endpoint" href="/verify-utr-only?utr=005228066783">https://fampayautoverify.onrender.com/verify-utr-only?utr=005228066783</a>
-    <p class="hint">Returns payment details if found in last 3 days. Never blocks.</p></div>
+        <style>
 
-    <div class="card"><h2>6. Verify by Order ID + UTR</h2>
-    <a class="endpoint" href="/verify-by-utr-get?order_id=ORD20260922162131U1T1790094090&utr=005228066783">https://fampayautoverify.onrender.com/verify-by-utr-get?order_id=ORD20260922162131U1T1790094090&utr=005228066783</a>
-    <p class="hint">Returns order + payment details. Never blocks.</p></div>
+            body {
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    sans-serif;
 
-    <div class="card"><h2>7. Verify by Order ID Only</h2>
-    <a class="endpoint" href="/verify-by-amount-get?order_id=ORD20260922162131U1T1790094090">https://fampayautoverify.onrender.com/verify-by-amount-get?order_id=ORD20260922162131U1T1790094090</a></div>
+                max-width: 1100px;
 
-    <div class="card"><h2>8. Verify by Amount Only</h2>
-    <a class="endpoint" href="/verify-amount-only?amount=1">https://fampayautoverify.onrender.com/verify-amount-only?amount=1</a>
-    <p class="hint">Returns all matching payments from last 3 days. Never blocks.</p></div>
+                margin: 0 auto;
 
-    <div class="card"><h2>9. All Payments — Last 3 Days</h2>
-    <a class="endpoint" href="/payments?days=3">https://fampayautoverify.onrender.com/payments?days=3</a></div>
+                padding: 25px;
 
-    <div class="card"><h2>10. All Orders Stored</h2>
-    <a class="endpoint" href="/orders">https://fampayautoverify.onrender.com/orders</a></div>
+                background: #f5f7fa;
 
-    <div class="card"><h2>11. Swagger UI</h2>
-    <a class="endpoint" href="/docs">https://fampayautoverify.onrender.com/docs</a></div>
+                color: #222;
+            }
 
-    <div class="card"><h2>12. ReDoc</h2>
-    <a class="endpoint" href="/redoc">https://fampayautoverify.onrender.com/redoc</a></div>
-    </body></html>
+            h1 {
+                margin-bottom: 5px;
+            }
+
+            .subtitle {
+                color: #666;
+                margin-bottom: 25px;
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns:
+                    repeat(auto-fit, minmax(280px, 1fr));
+
+                gap: 15px;
+            }
+
+            .card {
+                background: white;
+                padding: 20px;
+                border-radius: 14px;
+
+                box-shadow:
+                    0 3px 15px
+                    rgba(0,0,0,.06);
+            }
+
+            .card h2 {
+                margin-top: 0;
+                font-size: 18px;
+            }
+
+            a {
+                display: block;
+                padding: 11px;
+                margin-top: 10px;
+
+                background: #f1f5ff;
+
+                border-radius: 8px;
+
+                color: #1457d9;
+
+                text-decoration: none;
+
+                word-break: break-all;
+            }
+
+            a:hover {
+                background: #e7edff;
+            }
+
+            .status {
+                padding: 15px;
+
+                background: #ecfdf3;
+
+                border: 1px solid #bbf7d0;
+
+                border-radius: 12px;
+
+                margin-bottom: 20px;
+            }
+
+        </style>
+
+    </head>
+
+    <body>
+
+        <h1>FamPay UPI Verification System</h1>
+
+        <div class="subtitle">
+            Background Gmail collector + temporary payment cache
+        </div>
+
+        <div class="status">
+
+            <strong>Architecture:</strong>
+
+            Gmail → Background Collector →
+            Temporary SQLite DB → Instant API Lookup
+
+        </div>
+
+        <div class="grid">
+
+            <div class="card">
+
+                <h2>Health</h2>
+
+                <a href="/health">
+                    /health
+                </a>
+
+            </div>
+
+            <div class="card">
+
+                <h2>Collector Status</h2>
+
+                <a href="/collector/status">
+                    /collector/status
+                </a>
+
+            </div>
+
+            <div class="card">
+
+                <h2>Cached Payments</h2>
+
+                <a href="/payments">
+                    /payments
+                </a>
+
+            </div>
+
+            <div class="card">
+
+                <h2>Payments Page</h2>
+
+                <a href="/payments-page">
+                    /payments-page
+                </a>
+
+            </div>
+
+            <div class="card">
+
+                <h2>Orders</h2>
+
+                <a href="/orders">
+                    /orders
+                </a>
+
+            </div>
+
+            <div class="card">
+
+                <h2>Swagger</h2>
+
+                <a href="/docs">
+                    /docs
+                </a>
+
+            </div>
+
+            <div class="card">
+
+                <h2>ReDoc</h2>
+
+                <a href="/redoc">
+                    /redoc
+                </a>
+
+            </div>
+
+        </div>
+
+    </body>
+
+    </html>
     """
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "fam-pay-verifier"}
 
-# -------- CREATE ORDER --------
-@app.post("/create-order")
-async def create_order(req: CreateOrderRequest):
-    order_id = _make_order_id(req.note)
-    upi_url = _make_upi_url(req.amount, req.note)
-    qr_bytes = _make_qr_png(upi_url)
-    qr_b64 = base64.b64encode(qr_bytes).decode()
-    _store_order(order_id, req.amount, req.note)
+    with get_db() as conn:
+
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM payments"
+        ).fetchone()
+
+        payment_count = row["count"]
+
     return {
-        "order_id": order_id,
-        "amount": req.amount,
-        "note": req.note,
-        "upi_url": upi_url,
-        "qr_image_base64": qr_b64,
+        "status": "ok",
+        "service": "fam-pay-verifier",
+        "collector_running": collector_running,
+        "cached_payments": payment_count,
+        "cache_days": CACHE_DAYS,
+        "poll_interval_seconds": POLL_INTERVAL
     }
+
+
+# ============================================================
+# COLLECTOR STATUS
+# ============================================================
+
+@app.get("/collector/status")
+async def collector_status():
+
+    with get_db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM payments
+            """
+        ).fetchone()
+
+        payment_count = row["count"]
+
+    return {
+
+        "running": collector_running,
+
+        "started_at": collector_started_at,
+
+        "last_check": collector_last_check,
+
+        "last_success": collector_last_success,
+
+        "last_error": collector_last_error,
+
+        "last_uid": collector_last_uid,
+
+        "total_scanned": collector_total_scanned,
+
+        "total_saved": collector_total_saved,
+
+        "cached_payments": payment_count,
+
+        "cache_days": CACHE_DAYS,
+
+        "poll_interval_seconds": POLL_INTERVAL
+
+    }
+
+
+# ============================================================
+# CREATE ORDER
+# ============================================================
+
+@app.post("/create-order")
+async def create_order(
+    req: CreateOrderRequest
+):
+
+    order_id = _make_order_id(
+        req.note
+    )
+
+    upi_url = _make_upi_url(
+        req.amount,
+        req.note
+    )
+
+    qr_bytes = _make_qr_png(
+        upi_url
+    )
+
+    qr_b64 = base64.b64encode(
+        qr_bytes
+    ).decode()
+
+    _store_order(
+        order_id,
+        req.amount,
+        req.note
+    )
+
+    return {
+
+        "order_id": order_id,
+
+        "amount": req.amount,
+
+        "note": req.note,
+
+        "upi_url": upi_url,
+
+        "qr_image_base64": qr_b64
+
+    }
+
 
 @app.get("/create-order-get")
-async def create_order_get(amount: float, note: str):
-    return await create_order(CreateOrderRequest(amount=amount, note=note))
+async def create_order_get(
+    amount: float,
+    note: str
+):
+
+    return await create_order(
+        CreateOrderRequest(
+            amount=amount,
+            note=note
+        )
+    )
+
 
 @app.get("/create-order-qr")
-async def create_order_qr(amount: float, note: str):
-    order_id = _make_order_id(note)
-    upi_url = _make_upi_url(amount, note)
-    qr_bytes = _make_qr_png(upi_url)
-    _store_order(order_id, amount, note)
-    return Response(content=qr_bytes, media_type="image/png")
+async def create_order_qr(
+    amount: float,
+    note: str
+):
 
-# -------- VERIFY BY UTR ONLY — pure lookup, no blocking --------
+    order_id = _make_order_id(
+        note
+    )
+
+    upi_url = _make_upi_url(
+        amount,
+        note
+    )
+
+    qr_bytes = _make_qr_png(
+        upi_url
+    )
+
+    _store_order(
+        order_id,
+        amount,
+        note
+    )
+
+    return Response(
+        content=qr_bytes,
+        media_type="image/png"
+    )
+
+
+# ============================================================
+# VERIFY UTR — DATABASE ONLY
+# ============================================================
+
 @app.get("/verify-utr-only")
-async def verify_utr_only(utr: str):
-    """
-    Look up a UTR in last 3 days of FamPay emails.
-    Always returns details if found. Never blocks on 'already used'.
-    """
-    result = verifier.find_by_utr(utr, days=SEARCH_DAYS)
-    if result.get("found"):
-        p = result["payment"]
+async def verify_utr_only(
+    utr: str
+):
+
+    with get_db() as conn:
+
+        payment = conn.execute(
+            """
+            SELECT
+                utr,
+                amount,
+                sender_name,
+                note,
+                received_at,
+                subject
+            FROM payments
+
+            WHERE utr = ?
+
+            ORDER BY received_at DESC
+
+            LIMIT 1
+            """,
+            (utr,)
+        ).fetchone()
+
+    if not payment:
+
         return {
-            "found": True,
+
+            "found": False,
+
             "utr": utr,
-            "amount": p.get("amount"),
-            "sender_name": p.get("sender_name"),
-            "note": p.get("note"),
-            "received_at": p.get("received_at"),
-            "subject": p.get("subject"),
-        }
-    return {"found": False, "utr": utr, "message": result.get("message")}
 
-# -------- VERIFY BY AMOUNT ONLY — pure lookup, no blocking --------
-@app.get("/verify-amount-only")
-async def verify_amount_only(amount: float):
-    """
-    Look up all payments matching an amount in last 3 days.
-    Always returns all matches. Never blocks.
-    """
-    result = verifier.find_by_amount(amount, days=SEARCH_DAYS)
-    if result.get("found"):
-        return {
-            "found": True,
-            "amount": amount,
-            "match_count": len(result["matches"]),
-            "matches": result["matches"],
-        }
-    return {"found": False, "amount": amount, "match_count": 0, "matches": [], "message": result.get("message")}
+            "message":
+                "Payment not found in temporary cache"
 
-# -------- PAYMENTS LIST --------
-@app.get("/payments")
-async def payments(days: int = 3):
-    days = min(max(days, 1), SEARCH_DAYS)
-    result = verifier.fetch_all_payments(days=days)
-    if result.get("error"):
-        return {"error": result["error"], "payments": []}
+        }
+
     return {
-        "days_searched": days,
-        "count": len(result["payments"]),
-        "payments": result["payments"],
+
+        "found": True,
+
+        "utr": payment["utr"],
+
+        "amount": payment["amount"],
+
+        "sender_name":
+            payment["sender_name"],
+
+        "note":
+            payment["note"],
+
+        "received_at":
+            payment["received_at"],
+
+        "subject":
+            payment["subject"]
+
     }
 
-# -------- VERIFY BY UTR (with order) — pure lookup, no blocking --------
-@app.post("/verify-by-utr")
-async def verify_by_utr(req: VerifyRequest):
-    """
-    Return payment details for a UTR, plus the stored order if present.
-    Never blocks on 'already used' — that decision belongs to the website.
-    """
-    order_info = None
+
+# ============================================================
+# VERIFY AMOUNT — DATABASE ONLY
+# ============================================================
+
+@app.get("/verify-amount-only")
+async def verify_amount_only(
+    amount: float
+):
+
     with get_db() as conn:
-        order = conn.execute("SELECT * FROM orders WHERE order_id = ?", (req.order_id,)).fetchone()
+
+        rows = conn.execute(
+            """
+            SELECT
+                utr,
+                amount,
+                sender_name,
+                note,
+                received_at,
+                subject,
+                sender_email
+            FROM payments
+
+            WHERE amount >= ?
+              AND amount <= ?
+
+            ORDER BY received_at DESC
+            """,
+            (
+                amount - 0.01,
+                amount + 0.01
+            )
+        ).fetchall()
+
+    matches = [
+        dict(row)
+        for row in rows
+    ]
+
+    if matches:
+
+        return {
+
+            "found": True,
+
+            "amount": amount,
+
+            "match_count":
+                len(matches),
+
+            "matches":
+                matches
+
+        }
+
+    return {
+
+        "found": False,
+
+        "amount": amount,
+
+        "match_count": 0,
+
+        "matches": [],
+
+        "message":
+            "No matching payment in temporary cache"
+
+    }
+
+
+# ============================================================
+# ALL CACHED PAYMENTS
+# ============================================================
+
+@app.get("/payments")
+async def payments(
+    days: int = SEARCH_DAYS
+):
+
+    days = min(
+        max(days, 1),
+        SEARCH_DAYS
+    )
+
+    cutoff = (
+        utc_now() -
+        timedelta(days=days)
+    ).isoformat()
+
+    with get_db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                email_uid,
+                message_id,
+                utr,
+                amount,
+                sender_name,
+                note,
+                subject,
+                sender_email,
+                received_at,
+                cached_at
+
+            FROM payments
+
+            WHERE received_at >= ?
+
+            ORDER BY received_at DESC
+            """,
+            (cutoff,)
+        ).fetchall()
+
+    return {
+
+        "source": "temporary_database",
+
+        "days": days,
+
+        "count": len(rows),
+
+        "payments": [
+            dict(row)
+            for row in rows
+        ]
+
+    }
+
+
+# ============================================================
+# PAYMENTS HTML PAGE
+# ============================================================
+
+@app.get(
+    "/payments-page",
+    response_class=HTMLResponse
+)
+async def payments_page():
+
+    with get_db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                utr,
+                amount,
+                sender_name,
+                note,
+                subject,
+                received_at
+            FROM payments
+            ORDER BY received_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+
+    html_rows = ""
+
+    for row in rows:
+
+        amount = (
+            f"₹{row['amount']:.2f}"
+            if row["amount"] is not None
+            else "-"
+        )
+
+        utr = row["utr"] or "-"
+        sender = row["sender_name"] or "-"
+        note = row["note"] or "-"
+        received = row["received_at"] or "-"
+
+        html_rows += f"""
+        <tr>
+
+            <td>{amount}</td>
+
+            <td>
+                <code>{utr}</code>
+            </td>
+
+            <td>{sender}</td>
+
+            <td>{note}</td>
+
+            <td>{received}</td>
+
+        </tr>
+        """
+
+    if not html_rows:
+
+        html_rows = """
+        <tr>
+            <td colspan="5">
+                No cached payments yet.
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+
+    <html>
+
+    <head>
+
+        <meta charset="UTF-8">
+
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
+
+        <meta
+            http-equiv="refresh"
+            content="5"
+        >
+
+        <title>FamPay Payments</title>
+
+        <style>
+
+            * {{
+                box-sizing: border-box;
+            }}
+
+            body {{
+                margin: 0;
+
+                padding: 20px;
+
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    sans-serif;
+
+                background: #f5f7fa;
+
+                color: #111;
+            }}
+
+            .container {{
+                max-width: 1200px;
+
+                margin: auto;
+            }}
+
+            .header {{
+                background: white;
+
+                padding: 20px;
+
+                border-radius: 15px;
+
+                margin-bottom: 15px;
+
+                box-shadow:
+                    0 3px 15px
+                    rgba(0,0,0,.06);
+            }}
+
+            .table-wrap {{
+                background: white;
+
+                border-radius: 15px;
+
+                overflow: auto;
+
+                box-shadow:
+                    0 3px 15px
+                    rgba(0,0,0,.06);
+            }}
+
+            table {{
+                width: 100%;
+
+                border-collapse: collapse;
+
+                min-width: 800px;
+            }}
+
+            th {{
+                text-align: left;
+
+                background: #f1f3f5;
+
+                padding: 13px;
+
+                font-size: 13px;
+            }}
+
+            td {{
+                padding: 13px;
+
+                border-top:
+                    1px solid #eee;
+
+                font-size: 14px;
+            }}
+
+            code {{
+                font-family: monospace;
+            }}
+
+            .live {{
+                display: inline-block;
+
+                padding: 5px 9px;
+
+                background: #dcfce7;
+
+                color: #166534;
+
+                border-radius: 999px;
+
+                font-size: 12px;
+            }}
+
+        </style>
+
+    </head>
+
+    <body>
+
+        <div class="container">
+
+            <div class="header">
+
+                <h2>
+                    FamPay Cached Payments
+                </h2>
+
+                <span class="live">
+                    LIVE DATABASE
+                </span>
+
+                <p>
+                    Temporary payment cache.
+                    Automatically refreshed by
+                    background Gmail collector.
+                </p>
+
+                <p>
+                    Auto-refresh: 5 seconds
+                </p>
+
+            </div>
+
+            <div class="table-wrap">
+
+                <table>
+
+                    <thead>
+
+                        <tr>
+
+                            <th>Amount</th>
+
+                            <th>UTR</th>
+
+                            <th>Sender</th>
+
+                            <th>Note</th>
+
+                            <th>Received</th>
+
+                        </tr>
+
+                    </thead>
+
+                    <tbody>
+
+                        {html_rows}
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+        </div>
+
+    </body>
+
+    </html>
+    """
+
+# ============================================================
+# VERIFY BY UTR + ORDER
+# DATABASE ONLY
+# ============================================================
+
+@app.post("/verify-by-utr")
+async def verify_by_utr(
+    req: VerifyRequest
+):
+
+    order_info = None
+
+    with get_db() as conn:
+
+        order = conn.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE order_id = ?
+            """,
+            (req.order_id,)
+        ).fetchone()
+
         if order:
+
             order_info = dict(order)
 
-    utr_result = verifier.find_by_utr(req.utr, days=SEARCH_DAYS)
-    if utr_result.get("found"):
-        p = utr_result["payment"]
+        payment = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            WHERE utr = ?
+            ORDER BY received_at DESC
+            LIMIT 1
+            """,
+            (req.utr,)
+        ).fetchone()
+
+    if not payment:
+
         return {
-            "found": True,
+
+            "found": False,
+
             "utr": req.utr,
-            "amount": p.get("amount"),
-            "sender_name": p.get("sender_name"),
-            "note_in_email": p.get("note"),
-            "received_at": p.get("received_at"),
+
             "order": order_info,
+
+            "message":
+                "Payment not found in temporary cache"
+
         }
+
     return {
-        "found": False,
+
+        "found": True,
+
         "utr": req.utr,
-        "order": order_info,
-        "message": utr_result.get("message"),
+
+        "amount": payment["amount"],
+
+        "sender_name":
+            payment["sender_name"],
+
+        "note_in_email":
+            payment["note"],
+
+        "received_at":
+            payment["received_at"],
+
+        "order":
+            order_info
+
     }
+
 
 @app.get("/verify-by-utr-get")
-async def verify_by_utr_get(order_id: str, utr: str):
-    return await verify_by_utr(VerifyRequest(order_id=order_id, utr=utr))
+async def verify_by_utr_get(
+    order_id: str,
+    utr: str
+):
 
-# -------- VERIFY BY AMOUNT (with order) — pure lookup, no blocking --------
+    return await verify_by_utr(
+        VerifyRequest(
+            order_id=order_id,
+            utr=utr
+        )
+    )
+
+
+# ============================================================
+# VERIFY BY ORDER AMOUNT
+# DATABASE ONLY
+# ============================================================
+
 @app.post("/verify-by-amount")
-async def verify_by_amount(req: VerifyByAmountRequest):
-    """
-    Look up payments matching the stored order's amount.
-    Never blocks. Website handles rules.
-    """
-    order_info = None
+async def verify_by_amount(
+    req: VerifyByAmountRequest
+):
+
     with get_db() as conn:
-        order = conn.execute("SELECT * FROM orders WHERE order_id = ?", (req.order_id,)).fetchone()
-        if order:
-            order_info = dict(order)
 
-    if not order_info:
-        return {"found": False, "order_id": req.order_id, "message": "Order not found", "matches": []}
+        order = conn.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE order_id = ?
+            """,
+            (req.order_id,)
+        ).fetchone()
 
-    result = verifier.find_by_amount(order_info["amount"], days=SEARCH_DAYS)
-    if result.get("found"):
-        return {
-            "found": True,
-            "order": order_info,
-            "match_count": len(result["matches"]),
-            "matches": result["matches"],
-        }
+        if not order:
+
+            return {
+
+                "found": False,
+
+                "order_id":
+                    req.order_id,
+
+                "message":
+                    "Order not found",
+
+                "matches": []
+
+            }
+
+        order_info = dict(order)
+
+        rows = conn.execute(
+            """
+            SELECT
+                utr,
+                amount,
+                sender_name,
+                note,
+                received_at,
+                subject,
+                sender_email
+            FROM payments
+
+            WHERE amount >= ?
+              AND amount <= ?
+
+            ORDER BY received_at DESC
+            """,
+            (
+                float(order_info["amount"]) - 0.01,
+                float(order_info["amount"]) + 0.01
+            )
+        ).fetchall()
+
+    matches = [
+        dict(row)
+        for row in rows
+    ]
+
     return {
-        "found": False,
-        "order": order_info,
-        "match_count": 0,
-        "matches": [],
-        "message": result.get("message"),
+
+        "found":
+            bool(matches),
+
+        "order":
+            order_info,
+
+        "match_count":
+            len(matches),
+
+        "matches":
+            matches
+
     }
 
+
 @app.get("/verify-by-amount-get")
-async def verify_by_amount_get(order_id: str):
-    return await verify_by_amount(VerifyByAmountRequest(order_id=order_id))
+async def verify_by_amount_get(
+    order_id: str
+):
 
-# -------- CHECK ORDER --------
+    return await verify_by_amount(
+        VerifyByAmountRequest(
+            order_id=order_id
+        )
+    )
+
+
+# ============================================================
+# CHECK ORDER
+# ============================================================
+
 @app.get("/order/{order_id}")
-async def get_order(order_id: str):
-    with get_db() as conn:
-        order = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-        return dict(order)
+async def get_order(
+    order_id: str
+):
 
-# -------- LIST ALL ORDERS --------
+    with get_db() as conn:
+
+        order = conn.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE order_id = ?
+            """,
+            (order_id,)
+        ).fetchone()
+
+    if not order:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found"
+        )
+
+    return dict(order)
+
+
+# ============================================================
+# LIST ORDERS
+# ============================================================
+
 @app.get("/orders")
 async def list_orders():
+
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 200").fetchall()
-        return {"count": len(rows), "orders": [dict(r) for r in rows]}
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM orders
+            ORDER BY created_at DESC
+            LIMIT 200
+            """
+        ).fetchall()
+
+    return {
+
+        "count":
+            len(rows),
+
+        "orders": [
+            dict(row)
+            for row in rows
+        ]
+
+    }
+
+
+# ============================================================
+# MANUAL COLLECTOR REFRESH
+# ============================================================
+
+@app.post("/collector/refresh")
+async def collector_refresh():
+
+    try:
+
+        # This does NOT scan the entire 3-day history.
+        # It performs an incremental Gmail check.
+
+        saved = await asyncio.to_thread(
+            collector.run_cycle
+        )
+
+        return {
+
+            "success": True,
+
+            "new_payments_saved":
+                saved,
+
+            "cached_payments":
+                collector.get_payment_count()
+
+        }
+
+    except Exception as e:
+
+        return {
+
+            "success": False,
+
+            "error": str(e)
+
+        }
+
+
+# ============================================================
+# RUN DIRECTLY
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000"
+        )
+    )
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+        )
